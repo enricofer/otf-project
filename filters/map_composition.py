@@ -22,14 +22,23 @@ from os import remove
 from qgis.server import QgsServerFilter
 from qgis.core import (
     QgsProject,
-    QgsMapLayerRegistry,
     QgsMessageLog,
+    QgsCoordinateReferenceSystem,
     QgsVectorLayer,
     QgsRasterLayer)
-from .tools import generate_legend
+
+from PyQt5.QtCore import QByteArray
+
+from .tools import (
+    generate_legend,
+    validate_source_uri,
+    is_file_path,
+    layer_from_source)
 
 
 class MapComposition(QgsServerFilter):
+
+    """Class to create a QGIS Project with one or many layers."""
 
     def __init__(self, server_iface):
         super(MapComposition, self).__init__(server_iface)
@@ -41,22 +50,26 @@ class MapComposition(QgsServerFilter):
         Example :
         SERVICE=MAPCOMPOSITION&
         PROJECT=/destination/project.qgs&
-        FILES=/path/1.shp;/path/2.shp;/path/3.asc&
-        NAMES=Layer 1;Layer 2;Layer 3&
-        OVERWRITE=true
+        SOURCES=type=xyz&url=http://tile.osm.org/{z}/{x}/{y}.png?layers=osm;
+            /path/1.shp;/path/2.shp;/path/3.asc&
+        FILES={Legacy Name for Sources Parameter}
+        NAMES=basemap;Layer 1;Layer 2;Layer 3&
+        REMOVEQML=true&
+        OVERWRITE=true&
         """
-        QgsMessageLog.logMessage('MapComposition.responseComplete')
         request = self.serverInterface().requestHandler()
         params = request.parameterMap()
 
         if params.get('SERVICE', '').upper() == 'MAPCOMPOSITION':
-            request.clearHeaders()
-            request.setHeader('Content-type', 'text/plain')
+            #request.clearHeaders()
+            QgsMessageLog.logMessage('current headers: %s' % str(request.responseHeaders()))
+            request.setResponseHeader('Content-type', 'text/plain')
             request.clearBody()
 
+            QgsMessageLog.logMessage('params: %s' % str(params))
             project_path = params.get('PROJECT')
             if not project_path:
-                request.appendBody('PROJECT is missing.\n')
+                request.appendBody(QByteArray('PROJECT parameter is missing.\n'.encode()))
                 return
 
             overwrite = params.get('OVERWRITE')
@@ -68,73 +81,200 @@ class MapComposition(QgsServerFilter):
             else:
                 overwrite = False
 
-            if exists(project_path):
-                if not overwrite:
-                    msg = 'PROJECT is already existing : %s \n' % project_path
-                    request.appendBody(msg)
-                    return
+            remove_qml = params.get('REMOVEQML')
+            if remove_qml:
+                if remove_qml.upper() in ['1', 'YES', 'TRUE']:
+                    remove_qml = True
                 else:
-                    remove(project_path)
+                    remove_qml = False
+            else:
+                remove_qml = False
+            
 
-            files_parameters = params.get('FILES')
-            if not files_parameters:
-                request.appendBody('FILES is missing.\n')
+            if exists(project_path) and overwrite:
+                # Overwrite means create from scratch again
+                remove(project_path)
+
+            # Take datasource from SOURCES params
+            sources_parameters = params.get('SOURCES')
+
+            # In case SOURCES empty, maybe they are still using FILES.
+            # Support legacy params: FILES.
+            if not sources_parameters:
+                sources_parameters = params.get('FILES')
+
+            # In case FILES also empty, raise error and exit.
+            if not sources_parameters:
+                request.appendBody(QByteArray('SOURCES parameter is missing.\n'.encode()))
                 return
 
-            files = files_parameters.split(';')
-            for layer in files:
-                if not exists(layer):
-                    request.appendBody('file not found : %s.\n' % layer)
+            QgsMessageLog.logMessage('progress 0')
+
+            sources = sources_parameters.split(';')
+            for layer_source in sources:
+
+                if not validate_source_uri(layer_source):
+                    request.appendBody(QByteArray('invalid parameter: {0}.\n'.format(str(layer_source)).encode()))
                     return
+
+                if is_file_path(layer_source):
+                    if not exists(layer_source):
+                        request.appendBody(QByteArray('file not found : {0}.\n'.format(str(layer_source)).encode()))
+                        return
+                        
+            QgsMessageLog.logMessage('progress 1')
 
             names_parameters = params.get('NAMES', None)
             if names_parameters:
                 names = names_parameters.split(';')
-                if len(names) != len(files):
-                    request.appendBody('Not same length names and files')
+                if len(names) != len(sources):
+                    request.appendBody(QByteArray('Not same length between NAMES and SOURCES'.encode()))
                     return
             else:
-                names = [splitext(basename(layer))[0] for layer in files]
+                names = [
+                    splitext(basename(layer_source))[0]
+                    for layer_source in sources]
 
             QgsMessageLog.logMessage('Setting up project to %s' % project_path)
             project = QgsProject.instance()
             project.setFileName(project_path)
+            if exists(project_path) and not overwrite:
+                project.read()
+            else:
+                crs = params.get('CRS')
+                QgsMessageLog.logMessage('CRS %s' % crs)
+                if crs:
+                    project.setCrs(QgsCoordinateReferenceSystem(crs))
 
+
+            qml_files = []
+            # Loaded QGIS Layer
             qgis_layers = []
+            # QGIS Layer loaded by QGIS
+            project_qgis_layers = []
+            # Layer ids of vector and raster layers
             vector_layers = []
+            raster_layers = []
+            
+            QgsMessageLog.logMessage('progress 2')
 
-            for layer_name, layer in zip(names, files):
-                if layer.endswith(('shp', 'geojson')):
-                    qgis_layer = QgsVectorLayer(layer, layer_name, 'ogr')
-                    vector_layers.append(qgis_layer.id())
-
-                elif layer.endswith(('asc', 'tiff', 'tif')):
-                    qgis_layer = QgsRasterLayer(layer, layer_name)
-                else:
-                    request.appendBody('Invalid format : %s' % layer)
+            for layer_name, layer_source in zip(names, sources):
+                
+                qgis_layer = layer_from_source(layer_source, layer_name)
+                
+                if not qgis_layer:
+                    request.appendBody(QByteArray('Invalid format : {0}.\n'.format(layer_source).encode()))
                     return
 
                 if not qgis_layer.isValid():
-                    request.appendBody('Layer is not valid : %s' % layer)
+                    request.appendBody(QByteArray('Layer is not valid : {0}.\n'.format(layer_source).encode()))
                     return
+
+                if isinstance(qgis_layer, QgsRasterLayer):
+                    raster_layers.append(qgis_layer.id())
+                elif isinstance(qgis_layer, QgsVectorLayer):
+                    vector_layers.append(qgis_layer.id())
+                else:
+                    request.appendBody(QByteArray('Invalid type : {0} - {1}'.format(
+                        qgis_layer, type(qgis_layer)).encode()))
 
                 qgis_layers.append(qgis_layer)
 
-                # Add layer to the registry
-                QgsMapLayerRegistry.instance().addMapLayer(qgis_layer)
+                qml_file = splitext(layer_source)[0] + '.qml'
+                if exists(qml_file):
+                    # Check if there is a QML
+                    qml_files.append(qml_file)
+
+                style_manager = qgis_layer.styleManager()
+                style_manager.renameStyle('', 'default')
+
+            QgsMessageLog.logMessage('progress 3')
+
+            map_registry = QgsProject.instance()
+            # Add layer to the registry
+            if overwrite:
+                # Insert all new layers
+                map_registry.addMapLayers(qgis_layers)
+            else:
+                # Updating rules
+                # 1. Get existing layer by name
+                # 2. Compare source, if it is the same, don't update
+                # 3. If it is a new name, add it
+                # 4. If same name but different source, then update
+                for new_layer in qgis_layers:
+                    # Get existing layer by name
+                    current_layer = map_registry.mapLayersByName(
+                        new_layer.name())
+
+                    # If it doesn't exists, add new layer
+                    if not current_layer:
+                        map_registry.addMapLayer(new_layer)
+                        project_qgis_layers.append(new_layer)
+                    # If it is exists, compare source
+                    else:
+                        current_layer = current_layer[0]
+                        project_qgis_layers.append(current_layer)
+
+                        # Same source, don't update
+                        if current_layer.source() == new_layer.source():
+                            if isinstance(new_layer, QgsVectorLayer):
+                                vector_layers.remove(new_layer.id())
+                                vector_layers.append(current_layer.id())
+                            elif isinstance(new_layer, QgsRasterLayer):
+                                raster_layers.remove(new_layer.id())
+                                raster_layers.append(current_layer.id())
+
+                        # Different source, update
+                        else:
+                            QgsMessageLog.logMessage('Update {0}'.format(
+                                new_layer.name()))
+                            if isinstance(new_layer, QgsVectorLayer):
+                                project.removeEntry(
+                                    'WFSLayersPrecision', '/{0}'.format(
+                                        current_layer.id()))
+
+                            map_registry.removeMapLayer(current_layer.id())
+                            map_registry.addMapLayer(new_layer)
+
+
+            QgsMessageLog.logMessage('progress 4')
+
+            qgis_layers = [l for l in map_registry.mapLayers().values()]
+            
+            QgsMessageLog.logMessage('loaded layers: %s' % str(qgis_layers))
+            
 
             if len(vector_layers):
-                for layer in vector_layers:
-                    project.writeEntry('WFSLayersPrecision', '/%s' % layer, 8)
+                for layer_source in vector_layers:
+                    project.writeEntry(
+                        'WFSLayersPrecision', '/%s' % layer_source, 8)
                 project.writeEntry('WFSLayers', '/', vector_layers)
 
+            if len(raster_layers):
+                project.writeEntry('WCSLayers', '/', raster_layers)
+                
+            QgsMessageLog.logMessage('progress 5')
+
             project.write()
-            project.clear()
+            #project.clear()
 
             if not exists(project_path) and not isfile(project_path):
-                request.appendBody(project.error())
+                request.appendBody(QByteArray(project.error().encode()))
                 return
+                
+            QgsMessageLog.logMessage('progress 6')
 
             generate_legend(qgis_layers, project_path)
+            
+            QgsMessageLog.logMessage('progress 7')
 
-            request.appendBody('OK')
+            if remove_qml:
+                for qml in qml_files:
+                    QgsMessageLog.logMessage(
+                        'Removing QML {path}'.format(path=qml))
+                    remove(qml)
+                    
+            QgsMessageLog.logMessage('progress 8')
+
+            request.appendBody(QByteArray('OK'.encode()))
+            QgsMessageLog.logMessage('progress 9')

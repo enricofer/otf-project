@@ -17,29 +17,27 @@
 ***************************************************************************
 """
 
-from qgis.core import QgsMessageLog, QgsLogger
-# from filters.create_project import CreateProject
-from filters.map_composition import MapComposition
+from qgis.core import Qgis,QgsMessageLog, QgsLogger
+from .filters.map_composition import MapComposition
 
 __author__ = 'Etienne Trimaille'
 __date__ = '25/05/2016'
 
 
 class OtfProjectServer(object):
-    """Test plugin for QGIS server
-    this plugin loads all filters from the 'filters' directory and logs
-    errors"""
+
+    """Plugin to create QGIS Project on the server."""
 
     def __init__(self, server_iface):
         QgsMessageLog.logMessage(
-            'SUCCESS - OTF Project init', 'plugin', QgsMessageLog.INFO)
+            'SUCCESS - OTF Project init', 'plugin', Qgis.Info)
 
-        filters = [MapComposition]
+        filters = [MapComposition, ]
         for i, f in enumerate(filters):
             name = f.__name__
             try:
                 server_iface.registerFilter(f(server_iface), i)
                 QgsMessageLog.logMessage('OTF Project - loading %s' % name)
-            except Exception, e:
+            except Exception as e:
                 QgsMessageLog.logMessage(
                     'OTF Project - Error loading %s : %s' % (name, e))
