@@ -56,6 +56,7 @@ class MapComposition(QgsServerFilter):
         NAMES=basemap;Layer 1;Layer 2;Layer 3&
         REMOVEQML=true&
         OVERWRITE=true&
+        CRS=EPSG4623&
         """
         request = self.serverInterface().requestHandler()
         params = request.parameterMap()
